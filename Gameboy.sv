@@ -189,7 +189,7 @@ assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
 assign LED_USER  = ioctl_download | sav_pending;
-assign LED_DISK  = 0;
+assign LED_DISK  = {1'b1, ra_active};
 assign LED_POWER = 0;
 assign BUTTONS   = 0;
 assign HDMI_FREEZE = 0;
@@ -523,12 +523,12 @@ sdram sdram
 	.ch1_word   ( 1'b1 ),
 	.ch1_busy   ( save_busy ),
 
-	.ch2_addr   ( 0 ),
-	.ch2_wr     ( 0 ),
-	.ch2_din    ( 0 ),
-	.ch2_rd     ( 0 ),
-	.ch2_dout   (   ),
-	.ch2_busy   (   ),
+	.ch2_addr   ( ra_sdram_addr  ),
+	.ch2_wr     ( 1'b0           ),
+	.ch2_din    ( 8'd0           ),
+	.ch2_rd     ( ra_sdram_rd    ),
+	.ch2_dout   ( ra_sdram_dout  ),
+	.ch2_busy   ( ra_sdram_busy  ),
 
 	.refresh    ( sdram_pause_refresh )
 );
@@ -786,7 +786,15 @@ gb gb (
 	.savestate_sdram_busy(sdram_busy),
 
 	.rewind_on(status[27]),
-	.rewind_active(status[27] & joystick_0[10])
+	.rewind_active(status[27] & joystick_0[10]),
+
+	// RetroAchievements RAM read interface
+	.ra_wram_addr  (ra_wram_addr ),
+	.ra_wram_req   (ra_wram_req  ),
+	.ra_wram_dout  (ra_wram_dout ),
+	.ra_zpram_addr (ra_zpram_addr),
+	.ra_zpram_req  (ra_zpram_req ),
+	.ra_zpram_dout (ra_zpram_dout)
 );
 
 assign AUDIO_L = (fast_forward && status[25]) ? 16'd0 : GB_AUDIO_L;
@@ -954,6 +962,55 @@ wire fastforward = joystick_0[8] && !ioctl_download && !OSD_STATUS;
 
 wire sleep_savestate, savestate_ovr;
 
+// ==================== RetroAchievements ====================
+wire        ra_active;
+wire [14:0] ra_wram_addr;
+wire        ra_wram_req;
+wire  [7:0] ra_wram_dout;
+wire  [6:0] ra_zpram_addr;
+wire        ra_zpram_req;
+wire  [7:0] ra_zpram_dout;
+wire [24:0] ra_sdram_addr;
+wire        ra_sdram_rd;
+wire  [7:0] ra_sdram_dout;
+wire        ra_sdram_busy;
+wire [27:1] ra_ddram_addr;
+wire [63:0] ra_ddram_din;
+wire        ra_ddram_req;
+wire        ra_ddram_rnw;
+wire  [7:0] ra_ddram_be;
+wire [63:0] ra_ddram_dout;
+wire        ra_ddram_ready;
+
+ra_ram_mirror_gb ra_ram_mirror_gb (
+	.clk          (clk_sys),
+	.reset        (reset),
+	.vblank       (lcd_vsync & ~sleep_savestate & ~bk_state),
+
+	.wram_addr    (ra_wram_addr ),
+	.wram_req     (ra_wram_req  ),
+	.wram_dout    (ra_wram_dout ),
+
+	.zpram_addr   (ra_zpram_addr),
+	.zpram_req    (ra_zpram_req ),
+	.zpram_dout   (ra_zpram_dout),
+
+	.sdram_addr   (ra_sdram_addr),
+	.sdram_rd     (ra_sdram_rd  ),
+	.sdram_dout   (ra_sdram_dout),
+	.sdram_busy   (ra_sdram_busy),
+
+	.ddram_addr   (ra_ddram_addr ),
+	.ddram_din    (ra_ddram_din  ),
+	.ddram_req    (ra_ddram_req  ),
+	.ddram_rnw    (ra_ddram_rnw  ),
+	.ddram_be     (ra_ddram_be   ),
+	.ddram_dout   (ra_ddram_dout ),
+	.ddram_ready  (ra_ddram_ready),
+
+	.active       (ra_active)
+);
+
 reg paused;
 always_ff @(posedge clk_sys) begin
    paused <= sleep_savestate | (status[26] && OSD_STATUS && !ioctl_download && !reset && ~status[27]); // no pause when downloading rom, resetting or rewind capture is on
@@ -1037,7 +1094,15 @@ ddram ddram
 	.ch1_req(ss_req),
 	.ch1_rnw(ss_rnw),
 	.ch1_be(ss_be),
-	.ch1_ready(ss_ack)
+	.ch1_ready(ss_ack),
+
+	.ch2_addr(ra_ddram_addr),
+	.ch2_din(ra_ddram_din),
+	.ch2_dout(ra_ddram_dout),
+	.ch2_req(ra_ddram_req),
+	.ch2_rnw(ra_ddram_rnw),
+	.ch2_be(ra_ddram_be),
+	.ch2_ready(ra_ddram_ready)
 );
 
 // saving with keyboard/OSD/gamepad

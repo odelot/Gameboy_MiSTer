@@ -126,7 +126,15 @@ module gb (
 	input         savestate_sdram_busy,
 
 	input         rewind_on,
-	input         rewind_active
+	input         rewind_active,
+
+	// RetroAchievements RAM read interface
+	input  [14:0] ra_wram_addr,
+	input         ra_wram_req,
+	output  [7:0] ra_wram_dout,
+	input   [6:0] ra_zpram_addr,
+	input         ra_zpram_req,
+	output  [7:0] ra_zpram_dout
 );
 
 // savestates
@@ -864,11 +872,13 @@ dpram #(7) zpram (
 	.q_a       (zpram_do     ),
 	
 	.clock_b   (clk_sys),
-	.address_b (Savestate_RAMAddr[6:0]),
-	.wren_b    (Savestate_RAMRWrEn[3]),
+	.address_b (ra_zpram_req ? ra_zpram_addr : Savestate_RAMAddr[6:0]),
+	.wren_b    (ra_zpram_req ? 1'b0 : Savestate_RAMRWrEn[3]),
 	.data_b    (Savestate_RAMWriteData[7:0]),
 	.q_b       (Savestate_RAMReadData_ZRAM)
 );
+
+assign ra_zpram_dout = Savestate_RAMReadData_ZRAM;
 
 // --------------------------------------------------------------------
 // -------------------------- 8k/32k(GBC) work ram  -------------------
@@ -899,11 +909,13 @@ dpram #(15) wram (
 	.q_a       (wram_do),
 	
 	.clock_b   (clk_sys),
-	.address_b (Savestate_RAMAddr[14:0]),
-	.wren_b    (Savestate_RAMRWrEn[0]),
+	.address_b (ra_wram_req ? ra_wram_addr : Savestate_RAMAddr[14:0]),
+	.wren_b    (ra_wram_req ? 1'b0 : Savestate_RAMRWrEn[0]),
 	.data_b    (Savestate_RAMWriteData[7:0]),
 	.q_b       (Savestate_RAMReadData_WRAM)
 );
+
+assign ra_wram_dout = Savestate_RAMReadData_WRAM;
 
 //GBC WRAM banking
 assign SS_Top_BACK[2:0] = wram_bank;
