@@ -1,4 +1,4 @@
-// RetroAchievements RAM Mirror for Game Boy / Game Boy Color — Option C
+// RetroAchievements RAM Mirror for Game Boy / Game Boy Color — Option C + RTQuery (Tier 1)
 //
 // Each VBlank, reads a list of specific rcheevos addresses from DDRAM
 // (written by ARM), fetches byte values from WRAM BRAM, ZPRAM BRAM, or
@@ -70,6 +70,12 @@ localparam [27:1] ADDRLIST_BASE = DDRAM_BASE + 27'h20000;  // byte 0x40000 / 2
 localparam [27:1] VALCACHE_BASE = DDRAM_BASE + 27'h24000;  // byte 0x48000 / 2
 localparam [12:0] MAX_ADDRS     = 13'd4096;
 
+// Realtime query mailbox (Tier 1 smart cache) - [27:1] byte addressing
+localparam [27:1] QUERY_CTRL_ADDR = DDRAM_BASE + 27'h28000;  // byte offset 0x50000 / 2
+localparam [27:1] QUERY_REQ_BASE  = DDRAM_BASE + 27'h28004;  // byte offset 0x50008 / 2
+localparam [27:1] QUERY_RESP_BASE = DDRAM_BASE + 27'h28044;  // byte offset 0x50088 / 2
+localparam [3:0]  MAX_RT_QUERIES  = 4'd16;
+
 // Cart RAM SDRAM base address: {2'b01, 6'd0, offset[16:0]}
 localparam [24:0] CARTRAM_SDRAM_BASE = {2'b01, 6'd0, 17'd0};
 
@@ -79,6 +85,17 @@ localparam [24:0] CARTRAM_SDRAM_BASE = {2'b01, 6'd0, 17'd0};
 reg vblank_prev;
 wire vblank_rising = vblank & ~vblank_prev;
 always @(posedge clk) vblank_prev <= vblank;
+
+// Sticky vblank flag
+reg vblank_pending;
+always @(posedge clk) begin
+	if (reset)
+		vblank_pending <= 1'b0;
+	else if (vblank_rising)
+		vblank_pending <= 1'b1;
+	else if (state == S_IDLE && vblank_pending)
+		vblank_pending <= 1'b0;
+end
 
 // SDRAM busy edge detection
 reg sdram_busy_prev;
@@ -112,9 +129,23 @@ localparam S_WR_DBG       = 5'd20;  // Write debug word 1
 localparam S_WR_DBG2      = 5'd21;  // Write debug word 2
 localparam S_WRAM_READ    = 5'd22;  // Capture WRAM data (after BRAM latency)
 localparam S_ZPRAM_READ   = 5'd23;  // Capture ZPRAM data (after BRAM latency)
+// Realtime query states
+localparam S_QRY_PARSE    = 5'd24;
+localparam S_QRY_RD_REQ   = 5'd25;
+localparam S_QRY_FETCH    = 5'd26;
+localparam S_QRY_WRAM_W   = 5'd27;  // WRAM wait
+localparam S_QRY_WRAM_R   = 5'd28;  // WRAM read
+localparam S_QRY_ZPRAM_W  = 5'd29;  // ZPRAM wait
+localparam S_QRY_ZPRAM_R  = 5'd30;  // ZPRAM read
+localparam S_QRY_WR_RESP  = 5'd31;
 
-reg [4:0] state;
-reg [4:0] return_state;
+// Need 6 bits for remaining query states
+localparam S_QRY_CRAM     = 6'd32;  // Cart RAM SDRAM read
+localparam S_QRY_CRAM_W   = 6'd33;  // Cart RAM wait
+localparam S_QRY_WR_CTRL  = 6'd34;
+
+reg [5:0] state;
+reg [5:0] return_state;
 
 reg [31:0] frame_counter;
 always @(posedge clk) dbg_frame_counter <= frame_counter;
@@ -138,6 +169,17 @@ reg [15:0] dbg_timeout_cnt;
 reg [15:0] dbg_wram_cnt;
 reg [15:0] dbg_cram_cnt;
 reg [15:0] dbg_hram_cnt;
+
+// Realtime query registers
+reg  [7:0] qry_request_seq;
+reg  [7:0] qry_last_seen_seq;
+reg  [7:0] qry_num;
+reg  [3:0] qry_idx;
+reg [31:0] qry_addr;
+reg  [7:0] qry_num_bytes;
+reg [31:0] qry_value;
+reg  [2:0] qry_byte_idx;
+reg  [9:0] qry_poll_timer;
 
 // ======================================================================
 // Address translation helpers
@@ -226,6 +268,8 @@ always @(posedge clk) begin
 		frame_counter <= 32'd0;
 		wram_req      <= 1'b0;
 		zpram_req     <= 1'b0;
+		qry_last_seen_seq <= 8'd0;
+		qry_poll_timer <= 10'd0;
 	end
 	else begin
 		case (state)
@@ -237,14 +281,27 @@ always @(posedge clk) begin
 			active   <= 1'b0;
 			wram_req <= 1'b0;
 			zpram_req <= 1'b0;
-			if (vblank_rising) begin
+			if (vblank_pending) begin
 				active <= 1'b1;
+				qry_poll_timer  <= 10'd0;
 				dbg_ok_cnt      <= 16'd0;
 				dbg_timeout_cnt <= 16'd0;
 				dbg_wram_cnt    <= 16'd0;
 				dbg_cram_cnt    <= 16'd0;
 				dbg_hram_cnt    <= 16'd0;
 				state           <= S_WR_BUSY_HDR;
+			end
+			else if (qry_poll_timer < 10'd1000) begin
+				qry_poll_timer <= qry_poll_timer + 10'd1;
+			end
+			else begin
+				qry_poll_timer <= 10'd0;
+				ddram_addr   <= QUERY_CTRL_ADDR;
+				ddram_rnw    <= 1'b1;
+				ddram_be     <= 8'hFF;
+				ddram_req    <= 1'b1;
+				return_state <= S_QRY_PARSE;
+				state        <= S_WAIT_DDR_RD;
 			end
 		end
 
@@ -533,7 +590,7 @@ always @(posedge clk) begin
 		// =============================================================
 		S_WR_DBG: begin
 			ddram_addr   <= DDRAM_BASE + 27'd8;
-			ddram_din    <= {8'h01, 8'd0, 16'd0, dbg_timeout_cnt, dbg_ok_cnt};
+			ddram_din    <= {8'h02, 8'd0, 16'd0, dbg_timeout_cnt, dbg_ok_cnt};
 			ddram_be     <= 8'hFF;
 			ddram_rnw    <= 1'b0;
 			ddram_req    <= 1'b1;
@@ -547,6 +604,155 @@ always @(posedge clk) begin
 		S_WR_DBG2: begin
 			ddram_addr   <= DDRAM_BASE + 27'd12;
 			ddram_din    <= {16'd0, dbg_wram_cnt, dbg_cram_cnt, dbg_hram_cnt};
+			ddram_be     <= 8'hFF;
+			ddram_rnw    <= 1'b0;
+			ddram_req    <= 1'b1;
+			return_state <= S_IDLE;
+			state        <= S_WAIT_DDR_WR;
+		end
+
+		// =============================================================
+		// Realtime Query States
+		// =============================================================
+		S_QRY_PARSE: begin
+			if (rd_data[7:0] != qry_last_seen_seq && rd_data[15:8] != 8'd0) begin
+				qry_request_seq <= rd_data[7:0];
+				qry_num         <= (rd_data[15:8] > {4'd0, MAX_RT_QUERIES}) ?
+				                   {4'd0, MAX_RT_QUERIES} : rd_data[15:8];
+				qry_idx         <= 4'd0;
+				state           <= S_QRY_RD_REQ;
+			end else begin
+				state <= S_IDLE;
+			end
+		end
+
+		S_QRY_RD_REQ: begin
+			ddram_addr   <= QUERY_REQ_BASE + {23'd0, qry_idx[3:0], 2'b00};
+			ddram_rnw    <= 1'b1;
+			ddram_be     <= 8'hFF;
+			ddram_req    <= 1'b1;
+			return_state <= S_QRY_FETCH;
+			state        <= S_WAIT_DDR_RD;
+		end
+
+		S_QRY_FETCH: begin
+			qry_addr      <= rd_data[31:0];
+			qry_num_bytes <= (rd_data[39:32] == 8'd0) ? 8'd1 : rd_data[39:32];
+			qry_value     <= 32'd0;
+			qry_byte_idx  <= 3'd0;
+			// Use existing combinational translation (cur_addr is set here)
+			cur_addr      <= rd_data[31:0];
+			// Route based on address translation (same logic as S_DISPATCH)
+			if (rd_data[31:0] >= 32'hC000 && rd_data[31:0] <= 32'hDFFF) begin
+				// WRAM bank 0 or 1
+				if (rd_data[31:0] >= 32'hD000)
+					wram_addr <= {3'd1, rd_data[11:0]};
+				else
+					wram_addr <= {3'd0, rd_data[11:0]};
+				wram_req <= 1'b1;
+				state    <= S_QRY_WRAM_W;
+			end
+			else if (rd_data[31:0] >= 32'hE000 && rd_data[31:0] <= 32'hFDFF) begin
+				// Echo RAM
+				if (rd_data[12])
+					wram_addr <= {3'd1, rd_data[11:0]};
+				else
+					wram_addr <= {3'd0, rd_data[11:0]};
+				wram_req <= 1'b1;
+				state    <= S_QRY_WRAM_W;
+			end
+			else if (rd_data[31:0] >= 32'h10000 && rd_data[31:0] <= 32'h15FFF) begin
+				// GBC WRAM banks 2-7
+				wram_addr <= {rd_data[14:12] + 3'd2, rd_data[11:0]};
+				wram_req  <= 1'b1;
+				state     <= S_QRY_WRAM_W;
+			end
+			else if (rd_data[31:0] >= 32'hFF80 && rd_data[31:0] <= 32'hFFFE) begin
+				// ZPRAM (HRAM)
+				zpram_addr <= rd_data[6:0];
+				zpram_req  <= 1'b1;
+				state      <= S_QRY_ZPRAM_W;
+			end
+			else if ((rd_data[31:0] >= 32'hA000 && rd_data[31:0] <= 32'hBFFF) ||
+			         (rd_data[31:0] >= 32'h16000 && rd_data[31:0] <= 32'h33FFF)) begin
+				// Cart RAM (SDRAM)
+				state <= S_QRY_CRAM;
+			end
+			else begin
+				// Unmapped: return 0
+				state <= S_QRY_WR_RESP;
+			end
+		end
+
+		S_QRY_WRAM_W: begin
+			// BRAM address latched
+			state <= S_QRY_WRAM_R;
+		end
+
+		S_QRY_WRAM_R: begin
+			qry_value    <= qry_value | ({24'd0, wram_dout} << (qry_byte_idx * 8));
+			wram_req     <= 1'b0;
+			qry_byte_idx <= qry_byte_idx + 3'd1;
+			if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0])
+				state <= S_QRY_WR_RESP;
+			else begin
+				// Next byte (simplified: only handle single byte queries typically)
+				state <= S_QRY_WR_RESP; // Simplify: single byte per query
+			end
+		end
+
+		S_QRY_ZPRAM_W: begin
+			state <= S_QRY_ZPRAM_R;
+		end
+
+		S_QRY_ZPRAM_R: begin
+			qry_value    <= qry_value | ({24'd0, zpram_dout} << (qry_byte_idx * 8));
+			zpram_req    <= 1'b0;
+			qry_byte_idx <= qry_byte_idx + 3'd1;
+			state        <= S_QRY_WR_RESP;
+		end
+
+		S_QRY_CRAM: begin
+			// Translate address to SDRAM offset
+			if (qry_addr >= 32'hA000 && qry_addr <= 32'hBFFF)
+				sdram_addr <= CARTRAM_SDRAM_BASE + {12'd0, qry_addr[12:0]};
+			else
+				sdram_addr <= CARTRAM_SDRAM_BASE + {7'd0, qry_addr[17:0]} - 25'h16000 + 25'h2000;
+			sdram_rd      <= 1'b1;
+			sdram_timeout <= 16'd0;
+			state         <= S_QRY_CRAM_W;
+		end
+
+		S_QRY_CRAM_W: begin
+			sdram_timeout <= sdram_timeout + 16'd1;
+			if (sdram_timeout >= 16'hFFFF) begin
+				state <= S_QRY_WR_RESP;
+			end
+			else if (sdram_data_valid) begin
+				qry_value    <= qry_value | ({24'd0, sdram_dout} << (qry_byte_idx * 8));
+				qry_byte_idx <= qry_byte_idx + 3'd1;
+				state        <= S_QRY_WR_RESP;
+			end
+		end
+
+		S_QRY_WR_RESP: begin
+			ddram_addr   <= QUERY_RESP_BASE + {23'd0, qry_idx[3:0], 2'b00};
+			ddram_din    <= {32'd0, qry_value};
+			ddram_be     <= 8'hFF;
+			ddram_rnw    <= 1'b0;
+			ddram_req    <= 1'b1;
+			qry_idx      <= qry_idx + 4'd1;
+			if (qry_idx + 4'd1 >= qry_num[3:0])
+				return_state <= S_QRY_WR_CTRL;
+			else
+				return_state <= S_QRY_RD_REQ;
+			state <= S_WAIT_DDR_WR;
+		end
+
+		S_QRY_WR_CTRL: begin
+			qry_last_seen_seq <= qry_request_seq;
+			ddram_addr   <= QUERY_CTRL_ADDR;
+			ddram_din    <= {24'd0, qry_request_seq, 16'd0, qry_num[7:0], qry_request_seq};
 			ddram_be     <= 8'hFF;
 			ddram_rnw    <= 1'b0;
 			ddram_req    <= 1'b1;
