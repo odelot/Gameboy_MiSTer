@@ -74,6 +74,7 @@ localparam [12:0] MAX_ADDRS     = 13'd4096;
 localparam [27:1] QUERY_CTRL_ADDR = DDRAM_BASE + 27'h28000;  // byte offset 0x50000 / 2
 localparam [27:1] QUERY_REQ_BASE  = DDRAM_BASE + 27'h28004;  // byte offset 0x50008 / 2
 localparam [27:1] QUERY_RESP_BASE = DDRAM_BASE + 27'h28044;  // byte offset 0x50088 / 2
+localparam [27:1] ARM_CFG_ADDR    = DDRAM_BASE + 27'd32;        // byte offset 0x40 / 2: ARM-written config
 localparam [3:0]  MAX_RT_QUERIES  = 4'd16;
 
 // Cart RAM SDRAM base address: {2'b01, 6'd0, offset[16:0]}
@@ -143,6 +144,8 @@ localparam S_QRY_WR_RESP  = 5'd31;
 localparam S_QRY_CRAM     = 6'd32;  // Cart RAM SDRAM read
 localparam S_QRY_CRAM_W   = 6'd33;  // Cart RAM wait
 localparam S_QRY_WR_CTRL  = 6'd34;
+localparam S_RD_ARMCFG    = 6'd35;  // initiate read of ARM config word
+localparam S_PARSE_ARMCFG = 6'd36;  // latch rtquery_armed from rd_data[0]
 
 reg [5:0] state;
 reg [5:0] return_state;
@@ -179,7 +182,8 @@ reg [31:0] qry_addr;
 reg  [7:0] qry_num_bytes;
 reg [31:0] qry_value;
 reg  [2:0] qry_byte_idx;
-reg  [9:0] qry_poll_timer;
+reg  [10:0] qry_poll_timer;
+reg        rtquery_armed = 1'b0;  // set by ARM via RA_ARM_CFG_RTQUERY bit
 
 // ======================================================================
 // Address translation helpers
@@ -269,7 +273,7 @@ always @(posedge clk) begin
 		wram_req      <= 1'b0;
 		zpram_req     <= 1'b0;
 		qry_last_seen_seq <= 8'd0;
-		qry_poll_timer <= 10'd0;
+		qry_poll_timer <= 11'd0;
 	end
 	else begin
 		case (state)
@@ -291,17 +295,20 @@ always @(posedge clk) begin
 				dbg_hram_cnt    <= 16'd0;
 				state           <= S_WR_BUSY_HDR;
 			end
-			else if (qry_poll_timer < 10'd1000) begin
-				qry_poll_timer <= qry_poll_timer + 10'd1;
+			else if (qry_poll_timer < 11'd2000) begin
+				qry_poll_timer <= qry_poll_timer + 11'd1;
 			end
-			else begin
-				qry_poll_timer <= 10'd0;
+			else if (rtquery_armed) begin
+				qry_poll_timer <= 11'd0;
 				ddram_addr   <= QUERY_CTRL_ADDR;
 				ddram_rnw    <= 1'b1;
 				ddram_be     <= 8'hFF;
 				ddram_req    <= 1'b1;
 				return_state <= S_QRY_PARSE;
 				state        <= S_WAIT_DDR_RD;
+			end
+			else begin
+				qry_poll_timer <= 11'd0;  // no rtquery active, skip poll
 			end
 		end
 
@@ -607,8 +614,25 @@ always @(posedge clk) begin
 			ddram_be     <= 8'hFF;
 			ddram_rnw    <= 1'b0;
 			ddram_req    <= 1'b1;
-			return_state <= S_IDLE;
+			return_state <= S_RD_ARMCFG;  // read ARM config before returning to idle
 			state        <= S_WAIT_DDR_WR;
+		end
+
+		// Read ARM-written config byte once per VBlank.
+		// ARM sets RA_ARM_CFG_RTQUERY (bit 0) when rtquery is active.
+		// FPGA latches it to gate inter-VBlank query mailbox polling.
+		S_RD_ARMCFG: begin
+			ddram_addr   <= ARM_CFG_ADDR;
+			ddram_rnw    <= 1'b1;
+			ddram_be     <= 8'hFF;
+			ddram_req    <= 1'b1;
+			return_state <= S_PARSE_ARMCFG;
+			state        <= S_WAIT_DDR_RD;
+		end
+
+		S_PARSE_ARMCFG: begin
+			rtquery_armed <= rd_data[0];
+			state <= S_IDLE;
 		end
 
 		// =============================================================
