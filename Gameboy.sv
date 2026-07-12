@@ -217,7 +217,7 @@ localparam CONF_STR = {
 	"ONO,Super Game Boy,Off,Palette,On;",
 	"d5FC2,SGB,Load SGB border;",
 	"-;",
-	"C,Cheats;",
+	"HAC,Cheats;",
 	"h0OH,Cheats enabled,Yes,No;",
 	"-;",
 	"h2R9,Load Backup RAM;",
@@ -227,7 +227,7 @@ localparam CONF_STR = {
 	"OV,Savestates to SDCard,On,Off;",
 	"o01,Savestate Slot,1,2,3,4;",
 	"h3RS,Save state (Alt-F1);",
-	"h3RT,Restore state (F1);",
+	"hBRT,Restore state (F1);",
 	"-;",
 
 	"P1,Audio & Video;",
@@ -269,7 +269,7 @@ localparam CONF_STR = {
 	"P3-;",
 	"P3OP,FastForward Sound,On,Off;",
 	"P3OQ,Pause when OSD is open,Off,On;",
-	"P3OR,Rewind Capture,Off,On;",
+	"HAP3OR,Rewind Capture,Off,On;",
 	"P3-;",
 	"P3o3,Super Game Boy + GBC,Off,On;",
 
@@ -329,6 +329,12 @@ wire [15:0] joystick_analog_0;
 wire [10:0] ps2_key;
 wire [24:0] ps2_mouse;
 
+// RetroAchievements hardcore mode (set by Main via status[51]):
+// forces cheats off and blocks every restore vector (savestate load,
+// rewind) in hardware. Save state remains allowed (Alt-F1).
+wire hardcore  = status[51];
+wire rewind_en = status[27] & ~hardcore;
+
 wire [7:0]  filetype;
 
 reg  [31:0] sd_lba;
@@ -380,10 +386,13 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 
 	.buttons(buttons),
 	.status(status),
-	.status_menumask({6'h0,
+	// bit 10 ('A') = hardcore: hides Cheats menu and Rewind option.
+	// bit 11 ('B') = restore-state allowed: hides "Restore state" in hardcore.
+	.status_menumask({4'h0,
+        (cart_ready & ~hardcore), hardcore,
         gbc_raw_colors, fastboot_available,
         sys_megaduck, boot_gba_available, sgb_border_en, isGBC,
-        cart_ready, sav_supported, |tint, gg_available}),
+        cart_ready, sav_supported, |tint, (gg_available & ~hardcore)}),
 	.status_in({status[63:34],ss_slot,status[31:0]}),
 	.status_set(statusUpdate),
 	.direct_video(direct_video),
@@ -749,7 +758,7 @@ gb gb (
 	// Palette download will disable cheats option (HPS doesn't distinguish downloads),
 	// so clear the cheats and disable second option (chheats enable/disable)
 	.gg_reset((code_download && ioctl_wr && !ioctl_addr) | cart_download | palette_download),
-	.gg_en(~status[17]),
+	.gg_en(~status[17] & ~hardcore),
 	.gg_code(gg_code),
 	.gg_available(gg_available),
 	
@@ -785,8 +794,8 @@ gb gb (
 	
 	.savestate_sdram_busy(sdram_busy),
 
-	.rewind_on(status[27]),
-	.rewind_active(status[27] & joystick_0[10]),
+	.rewind_on(rewind_en),
+	.rewind_active(rewind_en & joystick_0[10]),
 
 	// RetroAchievements RAM read interface
 	.ra_wram_addr  (ra_wram_addr ),
@@ -1013,7 +1022,7 @@ ra_ram_mirror_gb ra_ram_mirror_gb (
 
 reg paused;
 always_ff @(posedge clk_sys) begin
-   paused <= sleep_savestate | (status[26] && OSD_STATUS && !ioctl_download && !reset && ~status[27]); // no pause when downloading rom, resetting or rewind capture is on
+   paused <= sleep_savestate | (status[26] && OSD_STATUS && !ioctl_download && !reset && ~rewind_en); // no pause when downloading rom, resetting or rewind capture is on
 end
 
 speedcontrol speedcontrol
@@ -1115,7 +1124,8 @@ savestate_ui savestate_ui
 (
 	.clk            (clk_sys       ),
 	.ps2_key        (ps2_key[10:0] ),
-	.allow_ss       (cart_ready    ),
+	.allow_ss       (cart_ready & ~hardcore),
+	.allow_save     (cart_ready    ),
 	.joySS          (joy0_unmod[9] ),
 	.joyRight       (joy0_unmod[0] ),
 	.joyLeft        (joy0_unmod[1] ),
@@ -1123,7 +1133,7 @@ savestate_ui savestate_ui
 	.joyUp          (joy0_unmod[3] ),
 	.joyStart       (joy0_unmod[7] ),
 	.joyRewind      (joy0_unmod[10]),
-	.rewindEnable   (status[27]    ), 
+	.rewindEnable   (rewind_en     ),
 	.status_slot    (status[33:32] ),
 	.OSD_saveload   (status[29:28] ),
 	.ss_save        (ss_save       ),
