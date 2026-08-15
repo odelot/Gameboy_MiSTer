@@ -146,6 +146,7 @@ localparam S_QRY_CRAM_W   = 6'd33;  // Cart RAM wait
 localparam S_QRY_WR_CTRL  = 6'd34;
 localparam S_RD_ARMCFG    = 6'd35;  // initiate read of ARM config word
 localparam S_PARSE_ARMCFG = 6'd36;  // latch rtquery_armed from rd_data[0]
+localparam S_QRY_DISPATCH = 6'd37;  // route one query byte by qry_addr (multi-byte loop)
 
 reg [5:0] state;
 reg [5:0] return_state;
@@ -664,47 +665,59 @@ always @(posedge clk) begin
 			qry_num_bytes <= (rd_data[39:32] == 8'd0) ? 8'd1 : rd_data[39:32];
 			qry_value     <= 32'd0;
 			qry_byte_idx  <= 3'd0;
-			// Use existing combinational translation (cur_addr is set here)
-			cur_addr      <= rd_data[31:0];
-			// Route based on address translation (same logic as S_DISPATCH)
-			if (rd_data[31:0] >= 32'hC000 && rd_data[31:0] <= 32'hDFFF) begin
+			state         <= S_QRY_DISPATCH;
+		end
+
+		// Route ONE query byte based on qry_addr. Multi-byte reads (2/4,
+		// issued by the ARM smart-cache miss path) loop back here with
+		// qry_addr+1 so each byte is translated independently — the old
+		// code routed only from rd_data and returned just byte 0
+		// ("single byte per query"), truncating 16/32-bit rtquery values.
+		S_QRY_DISPATCH: begin
+			cur_addr <= qry_addr;
+			if (qry_addr >= 32'hC000 && qry_addr <= 32'hDFFF) begin
 				// WRAM bank 0 or 1
-				if (rd_data[31:0] >= 32'hD000)
-					wram_addr <= {3'd1, rd_data[11:0]};
+				if (qry_addr >= 32'hD000)
+					wram_addr <= {3'd1, qry_addr[11:0]};
 				else
-					wram_addr <= {3'd0, rd_data[11:0]};
+					wram_addr <= {3'd0, qry_addr[11:0]};
 				wram_req <= 1'b1;
 				state    <= S_QRY_WRAM_W;
 			end
-			else if (rd_data[31:0] >= 32'hE000 && rd_data[31:0] <= 32'hFDFF) begin
+			else if (qry_addr >= 32'hE000 && qry_addr <= 32'hFDFF) begin
 				// Echo RAM
-				if (rd_data[12])
-					wram_addr <= {3'd1, rd_data[11:0]};
+				if (qry_addr[12])
+					wram_addr <= {3'd1, qry_addr[11:0]};
 				else
-					wram_addr <= {3'd0, rd_data[11:0]};
+					wram_addr <= {3'd0, qry_addr[11:0]};
 				wram_req <= 1'b1;
 				state    <= S_QRY_WRAM_W;
 			end
-			else if (rd_data[31:0] >= 32'h10000 && rd_data[31:0] <= 32'h15FFF) begin
+			else if (qry_addr >= 32'h10000 && qry_addr <= 32'h15FFF) begin
 				// GBC WRAM banks 2-7
-				wram_addr <= {rd_data[14:12] + 3'd2, rd_data[11:0]};
+				wram_addr <= {qry_addr[14:12] + 3'd2, qry_addr[11:0]};
 				wram_req  <= 1'b1;
 				state     <= S_QRY_WRAM_W;
 			end
-			else if (rd_data[31:0] >= 32'hFF80 && rd_data[31:0] <= 32'hFFFE) begin
+			else if (qry_addr >= 32'hFF80 && qry_addr <= 32'hFFFE) begin
 				// ZPRAM (HRAM)
-				zpram_addr <= rd_data[6:0];
+				zpram_addr <= qry_addr[6:0];
 				zpram_req  <= 1'b1;
 				state      <= S_QRY_ZPRAM_W;
 			end
-			else if ((rd_data[31:0] >= 32'hA000 && rd_data[31:0] <= 32'hBFFF) ||
-			         (rd_data[31:0] >= 32'h16000 && rd_data[31:0] <= 32'h33FFF)) begin
+			else if ((qry_addr >= 32'hA000 && qry_addr <= 32'hBFFF) ||
+			         (qry_addr >= 32'h16000 && qry_addr <= 32'h33FFF)) begin
 				// Cart RAM (SDRAM)
 				state <= S_QRY_CRAM;
 			end
 			else begin
-				// Unmapped: return 0
-				state <= S_QRY_WR_RESP;
+				// Unmapped: this byte contributes 0
+				qry_byte_idx <= qry_byte_idx + 3'd1;
+				if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
+					state <= S_QRY_WR_RESP;
+				end else begin
+					qry_addr <= qry_addr + 32'd1;  // next byte, stay in dispatch
+				end
 			end
 		end
 
@@ -717,11 +730,11 @@ always @(posedge clk) begin
 			qry_value    <= qry_value | ({24'd0, wram_dout} << (qry_byte_idx * 8));
 			wram_req     <= 1'b0;
 			qry_byte_idx <= qry_byte_idx + 3'd1;
-			if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0])
+			if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
 				state <= S_QRY_WR_RESP;
-			else begin
-				// Next byte (simplified: only handle single byte queries typically)
-				state <= S_QRY_WR_RESP; // Simplify: single byte per query
+			end else begin
+				qry_addr <= qry_addr + 32'd1;
+				state    <= S_QRY_DISPATCH;
 			end
 		end
 
@@ -733,7 +746,12 @@ always @(posedge clk) begin
 			qry_value    <= qry_value | ({24'd0, zpram_dout} << (qry_byte_idx * 8));
 			zpram_req    <= 1'b0;
 			qry_byte_idx <= qry_byte_idx + 3'd1;
-			state        <= S_QRY_WR_RESP;
+			if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
+				state <= S_QRY_WR_RESP;
+			end else begin
+				qry_addr <= qry_addr + 32'd1;
+				state    <= S_QRY_DISPATCH;
+			end
 		end
 
 		S_QRY_CRAM: begin
@@ -750,12 +768,18 @@ always @(posedge clk) begin
 		S_QRY_CRAM_W: begin
 			sdram_timeout <= sdram_timeout + 16'd1;
 			if (sdram_timeout >= 16'hFFFF) begin
+				// SDRAM channel dead: bail out with what we have
 				state <= S_QRY_WR_RESP;
 			end
 			else if (sdram_data_valid) begin
 				qry_value    <= qry_value | ({24'd0, sdram_dout} << (qry_byte_idx * 8));
 				qry_byte_idx <= qry_byte_idx + 3'd1;
-				state        <= S_QRY_WR_RESP;
+				if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
+					state <= S_QRY_WR_RESP;
+				end else begin
+					qry_addr <= qry_addr + 32'd1;
+					state    <= S_QRY_DISPATCH;
+				end
 			end
 		end
 
