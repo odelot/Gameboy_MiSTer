@@ -70,6 +70,19 @@ localparam [27:1] ADDRLIST_BASE = DDRAM_BASE + 27'h20000;  // byte 0x40000 / 2
 localparam [27:1] VALCACHE_BASE = DDRAM_BASE + 27'h24000;  // byte 0x48000 / 2
 localparam [12:0] MAX_ADDRS     = 13'd4096;
 
+// Version published in the DDRAM header (major<<8 | minor). Main surfaces it
+// as "FPGA core version" in the log and in the RA User-Agent.
+//   major 2 = Selective Address + RTQuery (matches the 8'h02 in the debug word
+//             at byte 0x17 that gates rtquery on the ARM side)
+//   minor   = build revision — BUMP ON EVERY SYNTHESIS.
+//
+// The minor exists purely so a log identifies which bitstream produced it:
+// two builds whose behaviour looks identical are otherwise indistinguishable,
+// and "did the new core actually load?" is not a question a log should leave
+// open. Until now this header carried 0 and Main fell back to a hardcoded
+// "0.1", so the GB core was reporting a version it never wrote.
+localparam [15:0] CORE_VERSION  = 16'h0201;   // 2.1
+
 // Realtime query mailbox (Tier 1 smart cache) - [27:1] byte addressing
 localparam [27:1] QUERY_CTRL_ADDR = DDRAM_BASE + 27'h28000;  // byte offset 0x50000 / 2
 localparam [27:1] QUERY_REQ_BASE  = DDRAM_BASE + 27'h28004;  // byte offset 0x50008 / 2
@@ -318,7 +331,7 @@ always @(posedge clk) begin
 		// =============================================================
 		S_WR_BUSY_HDR: begin
 			ddram_addr   <= DDRAM_BASE;
-			ddram_din    <= {16'd0, 8'h01, 8'd0, 32'h52414348}; // "RACH", busy=1
+			ddram_din    <= {CORE_VERSION, 8'h01, 8'd0, 32'h52414348}; // "RACH", busy=1
 			ddram_be     <= 8'hFF;
 			ddram_rnw    <= 1'b0;
 			ddram_req    <= 1'b1;
@@ -571,7 +584,7 @@ always @(posedge clk) begin
 		// =============================================================
 		S_WR_HDR0: begin
 			ddram_addr   <= DDRAM_BASE;
-			ddram_din    <= {16'd0, 8'h00, 8'd0, 32'h52414348}; // busy=0
+			ddram_din    <= {CORE_VERSION, 8'h00, 8'd0, 32'h52414348}; // busy=0
 			ddram_be     <= 8'hFF;
 			ddram_rnw    <= 1'b0;
 			ddram_req    <= 1'b1;
