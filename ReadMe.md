@@ -27,13 +27,13 @@ The [upstream Gameboy_MiSTer](https://github.com/MiSTer-devel/Gameboy_MiSTer) co
 | File | Change |
 |------|--------|
 | `Gameboy.sv` | RA mirror module instantiated, SDRAM ch2 wired for Cart RAM reads, LED_DISK shows RA activity |
-| `rtl/gb.v` | WRAM and ZPRAM BRAMs: Port B multiplexed between savestate access and RA reads; RA interface ports added |
+| `rtl/gb.v` | WRAM and ZPRAM BRAMs: Port B multiplexed between savestate access, RA reads and the power-on RAM fill; RA interface ports added; `ra_vblank` exported as the RA sampling point |
 | `rtl/ddram.sv` | Channel 2 documentation updated for RA read/write operations |
 | `files.qip` | Added `ra_ram_mirror_gb.sv` to the Quartus build |
 
 ### How the RAM Mirroring Works
 
-The Game Boy has a Z80-derived 8-bit architecture with a compact but banked memory map (especially on GBC). This core uses the **Selective Address protocol** (Option C): the ARM binary writes a list of addresses it needs to evaluate, and the FPGA reads only those values and writes them back to DDRAM.
+The Game Boy has a Z80-derived 8-bit architecture with a compact but banked memory map (especially on GBC). This core uses the **Selective Address protocol** with the **RTQuery mailbox** (FPGA protocol v2): the ARM binary writes a list of addresses it needs to evaluate, the FPGA reads only those values once per frame and writes them back to DDRAM, and between frames it serves on-demand reads for addresses that are not on the list yet.
 
 **Memory regions exposed:**
 
@@ -61,17 +61,33 @@ The Game Boy has a Z80-derived 8-bit architecture with a compact but banked memo
 
 - **DDRAM arbitration** — The core's `ddram.sv` module provides channel-based arbitration. Channel 1 is for savestates, channel 2 is for the RA mirror (read + write). The RA mirror uses 64-bit DDRAM transactions with byte enables.
 
-- **VBlank gating** — The mirror only triggers on VBlank when savestates and backup save operations are idle (`lcd_vsync & ~sleep_savestate & ~bk_state`).
+- **VBlank gating** — The mirror only triggers when savestates and backup save operations are idle (`ra_vblank & ~sleep_savestate & ~bk_state`).
 
 - **Activity LED** — `LED_DISK[0]` indicates RA mirror activity.
 
+- **Smart Cache and the RTQuery mailbox** — The address list is not static. The ARM binary bootstraps it from the achievement set, then grows it at runtime: when a condition reads an address that is not in the list (typically an `AddAddress` pointer target), the read is answered live through the RTQuery mailbox at DDRAM offset `0x50000` and the address is added to the list for the next frame. The mailbox holds 16 request slots (`0x50008`) and 16 response slots (`0x50088`), and the mirror polls it roughly every 2000 clocks while idle, gated by a config bit the ARM sets so the polling costs nothing when RTQuery is unused. Multi-byte queries (16/32-bit reads) are served by re-dispatching each byte through the same region routing as the batch path, so a query may span WRAM, HRAM and Cart RAM.
+
+- **VBlank sampling point** — The mirror samples on the rising edge of `vblank_irq`, which is the `LY 143 → 144` transition, i.e. the exact moment the Game Boy raises the VBlank interrupt and before the game's VBlank handler runs. This matches where RAVBA (the emulator Game Boy achievement sets are authored against) evaluates achievements, alongside its `register_IF |= 1`. 
+
+- **Power-on RAM contents** — WRAM and HRAM are filled at reset with the pattern the reference emulator produces, not with zeros:
+
+  | Region | Fill |
+  |--------|------|
+  | HRAM (`$FF80–$FFFE`) | `0xFF` |
+  | WRAM (all banks) | 8-byte blocks alternating `0x0F` / `0xFF`, polarity inverting every `0x800` bytes |
+
+  This reproduces RAVBA's `gbReset()`, whose own comment notes it is "way closer to the reality than filling it with 00es or FFes" and that "the starting data are important for some 'buggy' games". It matters beyond fidelity: achievement conditions are written against these values, so a guard such as `$FF9F == 0` is meant to be *false* on a fresh boot. Filling with zeros makes such guards pass and unlocks achievements that never trigger on an emulator.
+
+  The fill is a sweep over Port B while the core is held in reset (~0.7 ms), so the CPU cannot write RAM before it completes, and it also removes any leftovers from a previous game or reset. Cartridge RAM is deliberately untouched, since that is battery-backed save data.
+
 **Per-VBlank flow:**
-1. On VBlank, the RA mirror writes the header with `busy=1`.
+1. At the VBlank interrupt (`LY 143 → 144`), the RA mirror writes the header with `busy=1`.
 2. It reads the address request list from DDRAM at offset `0x40000`.
 3. For each address, it dispatches to the appropriate memory source (WRAM/ZPRAM via BRAM Port B, or Cart RAM via SDRAM ch2).
 4. Values are collected 8 bytes at a time into 64-bit words and written to the response cache at offset `0x48000`.
 5. A response header with the current frame counter is written so the ARM can detect new data.
 6. The header `busy` flag is cleared and debug counters are updated.
+7. Between frames, the mirror polls the RTQuery mailbox and answers any on-demand read the ARM binary posts there.
 
 ---
 
