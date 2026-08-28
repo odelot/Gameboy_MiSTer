@@ -74,6 +74,16 @@ module gb (
 	output [1:0] lcd_mode,
 	output lcd_on,
 	output lcd_vsync,
+	// RetroAchievements sampling point. Rising edge = the LY 143->144
+	// transition, the same instant the VBlank IF flag is raised and *before*
+	// the CPU runs the VBlank handler. RAVBA (the emulator RA Game Boy sets
+	// are authored against) evaluates exactly there: gb.cpp does
+	// `register_IF |= 1; ... systemFrame();` on `register_LY == kGBHeight`,
+	// in both the LCD-on and LCD-off paths. lcd_vsync is NOT equivalent — it
+	// rises on line 0 (video.v: `vsync <= !v_cnt`), i.e. at the *end* of
+	// VBlank, by which time the handler has already rewritten its HRAM
+	// scratch.
+	output ra_vblank,
 
 	output [1:0] joy_p54,
 	input  [3:0] joy_din,
@@ -327,12 +337,74 @@ wire cpu_clken = ~hdma_cpu_stop & ce_cpu;
 assign sdram_rd = ~cpu_phi_early | hdma_rd_clk; // For SDRAM read & refresh
 
 reg reset_r  = 1;
-wire reset_ss;
 
 //sync reset with clock
 always  @ (posedge clk) begin
 	reset_r <= reset;
 end
+
+// ---------------------------------------------------------------------------
+// Power-on / reset RAM initialisation
+//
+// MiSTer's BRAMs keep their contents across a core reset or a new ROM load,
+// and power up as zeros, so a game reading an uninitialised variable sees
+// either the previous session's data or all-zeros. Neither matches hardware,
+// and RetroAchievements sets are authored against a *specific* power-on
+// pattern, so "wrong but plausible" values silently break them.
+//
+// The fill values below reproduce RAVBA's gbReset() (src/core/gb/gb.cpp),
+// the emulator RA Game Boy sets are written against:
+//
+//     memset(gbMemory, 0xff, 65536);
+//     for (temp = 0xC000; temp < 0xE000; temp++)
+//         if ((temp & 0x8) ^ ((temp & 0x800) >> 8)) gbMemory[temp] = 0x0f;
+//         else                                      gbMemory[temp] = 0xff;
+//
+// i.e. everything 0xFF, with WRAM carrying 8-byte blocks alternating between
+// 0x0F and 0xFF whose polarity flips every 0x800 bytes. Its own comment notes
+// this is "way closer to the reality than filling it with 00es or FFes" and
+// that "the starting data are important for some 'buggy' games".
+//
+// Filling with 0x00 is what caused Super Mario Land's "Pocket Change" to
+// false-unlock here: its guard is `$FF9F == 0`, which on the emulator is
+// blocked because uninitialised HRAM reads 0xFF.
+//
+// Sweep WRAM and HRAM through port B while holding the core in reset, the
+// same approach the MegaDrive and SNES cores already use. Cartridge RAM is
+// deliberately NOT touched: that is battery-backed save data.
+//
+// reset_ss (the reset every submodule and the CPU use) is extended for the
+// duration of the sweep, so the CPU cannot write RAM while we are filling it.
+// The savestate path is untouched: ram_clr is driven from `reset` only, never
+// from a savestate load.
+// ---------------------------------------------------------------------------
+reg  [14:0] ram_clr_addr = 15'd0;
+reg         ram_clr      = 1'b1;   // sweep once at power-up as well
+reg         reset_s1     = 1'b1;   // `reset` sampled into the clk_sys domain
+reg         reset_s2     = 1'b1;   // (module scope: this is a .v file)
+
+always @(posedge clk_sys) begin
+	reset_s1 <= reset;
+	reset_s2 <= reset_s1;
+
+	if (reset_s2) begin
+		ram_clr      <= 1'b1;
+		ram_clr_addr <= 15'd0;
+	end
+	else if (ram_clr) begin
+		ram_clr_addr <= ram_clr_addr + 1'd1;
+		if (&ram_clr_addr) ram_clr <= 1'b0;   // one full 32K pass (~0.7 ms)
+	end
+end
+
+// WRAM power-on byte: RAVBA's `(temp & 0x8) ^ ((temp & 0x800) >> 8)` — bit 3
+// XOR bit 11 of the CPU address. The BRAM index is {bank[2:0], offset[11:0]},
+// so bits 3 and 11 are the same bits for banks 0/1 ($C000/$D000 contribute
+// nothing at those positions); GBC banks 2-7 inherit the same pattern.
+wire [7:0] ram_clr_wram_data = (ram_clr_addr[3] ^ ram_clr_addr[11]) ? 8'h0F : 8'hFF;
+
+wire reset_ss_raw;
+wire reset_ss = reset_ss_raw | ram_clr;
 
 reg old_cpu_wr_n;
 
@@ -592,6 +664,11 @@ reg [3:0] inputD, inputD2;
 assign irq_n = !(ie_r & if_r);
 
 wire video_irq,vblank_irq;
+
+// Expose the VBlank-entry level to the RA mirror (see the port comment).
+// vblank_irq is high for LY 144..153, so its rising edge is the LY 143->144
+// transition — the RAVBA sampling point.
+assign ra_vblank = vblank_irq;
 wire timer_irq;
 
 reg old_vblank_irq, old_video_irq, old_timer_irq, old_serial_irq;
@@ -622,7 +699,7 @@ always @(negedge clk_sys) begin //negedge to trigger interrupt earlier
 		// "When an interrupt signal changes from low to high,
 		//  then the corresponding bit in the IF register becomes set."
 		old_vblank_irq <= vblank_irq;
-		if(~old_vblank_irq & vblank_irq) if_r[0] <= 1'b1;
+		if(~old_vblank_irq & vblank_irq) if_r[0] <= 1'b1;   // == RAVBA's `register_IF |= 1`
 	
 		// video irq already is a 1 clock event
 		old_video_irq <= video_irq;
@@ -872,9 +949,9 @@ dpram #(7) zpram (
 	.q_a       (zpram_do     ),
 	
 	.clock_b   (clk_sys),
-	.address_b (ra_zpram_req ? ra_zpram_addr : Savestate_RAMAddr[6:0]),
-	.wren_b    (ra_zpram_req ? 1'b0 : Savestate_RAMRWrEn[3]),
-	.data_b    (Savestate_RAMWriteData[7:0]),
+	.address_b (ram_clr ? ram_clr_addr[6:0] : (ra_zpram_req ? ra_zpram_addr : Savestate_RAMAddr[6:0])),
+	.wren_b    (ram_clr ? 1'b1 : (ra_zpram_req ? 1'b0 : Savestate_RAMRWrEn[3])),
+	.data_b    (ram_clr ? 8'hFF : Savestate_RAMWriteData[7:0]),   // HRAM: RAVBA leaves 0xFF
 	.q_b       (Savestate_RAMReadData_ZRAM)
 );
 
@@ -909,9 +986,9 @@ dpram #(15) wram (
 	.q_a       (wram_do),
 	
 	.clock_b   (clk_sys),
-	.address_b (ra_wram_req ? ra_wram_addr : Savestate_RAMAddr[14:0]),
-	.wren_b    (ra_wram_req ? 1'b0 : Savestate_RAMRWrEn[0]),
-	.data_b    (Savestate_RAMWriteData[7:0]),
+	.address_b (ram_clr ? ram_clr_addr : (ra_wram_req ? ra_wram_addr : Savestate_RAMAddr[14:0])),
+	.wren_b    (ram_clr ? 1'b1 : (ra_wram_req ? 1'b0 : Savestate_RAMRWrEn[0])),
+	.data_b    (ram_clr ? ram_clr_wram_data : Savestate_RAMWriteData[7:0]),
 	.q_b       (Savestate_RAMReadData_WRAM)
 );
 
@@ -1095,7 +1172,7 @@ wire loading_savestate, saving_savestate;
 gb_savestates gb_savestates (
    .clk                    (clk_sys),
    .reset_in               (reset_r),
-   .reset_out              (reset_ss),
+   .reset_out              (reset_ss_raw),
    
    .load_done              (savestate_loaded),
    

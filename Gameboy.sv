@@ -665,6 +665,7 @@ wire [1:0] lcd_mode;
 wire [1:0] lcd_data_gb;
 wire lcd_on;
 wire lcd_vsync;
+wire ra_vblank;   // LY>=144 level; rising edge = RA sampling point (see gb.v)
 
 wire DMA_on;
 
@@ -744,6 +745,7 @@ gb gb (
 	.lcd_mode    ( lcd_mode   ),
 	.lcd_on      ( lcd_on     ),
 	.lcd_vsync   ( lcd_vsync  ),
+	.ra_vblank   ( ra_vblank  ),
 	
 	.speed       ( speed      ),
 	.DMA_on      ( DMA_on    ),
@@ -994,7 +996,12 @@ wire        ra_ddram_ready;
 ra_ram_mirror_gb ra_ram_mirror_gb (
 	.clk          (clk_sys),
 	.reset        (reset),
-	.vblank       (lcd_vsync & ~sleep_savestate & ~bk_state),
+	// Sample at VBlank *entry* (LY 143->144), not lcd_vsync (line 0 = VBlank
+	// exit). RAVBA evaluates achievements at LY==144 before the CPU runs the
+	// VBlank handler; sampling at line 0 caught HRAM scratch the handler had
+	// already overwritten, which false-unlocked Super Mario Land's "Pocket
+	// Change" ($FFFA read as 0xDA — not even valid BCD for a coin count).
+	.vblank       (ra_vblank & ~sleep_savestate & ~bk_state),
 
 	.wram_addr    (ra_wram_addr ),
 	.wram_req     (ra_wram_req  ),
