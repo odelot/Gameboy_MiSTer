@@ -39,6 +39,13 @@ module video (
 	input [7:0] cpu_di,
 	output [7:0] cpu_do,
 
+	// RetroAchievements read ports: video registers and OAM
+	input  [7:0] ra_reg_addr,
+	output [7:0] ra_reg_do,
+	input  [7:0] ra_oam_addr,
+	input        ra_oam_req,
+	output [7:0] ra_oam_dout,
+
 	// output to lcd
 	output lcd_on,
 	output lcd_clkena,
@@ -548,6 +555,28 @@ always @(posedge clk) begin
 	end
 end
 
+
+assign ra_reg_do =
+	(ra_reg_addr == 8'h40)?lcdc:
+	(ra_reg_addr == 8'h41)?{1'b1,stat[6:3], lyc_match_l, mode}:
+	(ra_reg_addr == 8'h42)?scy:
+	(ra_reg_addr == 8'h43)?scx:
+	(ra_reg_addr == 8'h44)?ly:
+	(ra_reg_addr == 8'h45)?lyc:
+	(ra_reg_addr == 8'h46)?dma:
+	(ra_reg_addr == 8'h47)?bgp:
+	(ra_reg_addr == 8'h48)?obp0:
+	(ra_reg_addr == 8'h49)?obp1:
+	(ra_reg_addr == 8'h4a)?wy:
+	(ra_reg_addr == 8'h4b)?wx:
+	isGBC?
+		(ra_reg_addr == 8'h68)?{bgpi_ai,1'd1,bgpi}:
+		(ra_reg_addr == 8'h69 && isGBC_mode && vram_cpu_allow)?bgpd[bgpi]:
+		(ra_reg_addr == 8'h6a)?{obpi_ai,1'd1,obpi}:
+		(ra_reg_addr == 8'h6b && isGBC_mode && vram_cpu_allow)?obpd[obpi]:
+		(ra_reg_addr == 8'h6c) ? { 7'h7f, ff6c_opri } :
+		8'hff:
+	8'hff;
 
 assign cpu_do =
 	cpu_sel_oam?oam_do:
@@ -1075,6 +1104,10 @@ sprites sprites (
 	.spr_extra_prio   ( spr_extra_prio ),
 	.spr_extra_cgb_pal( spr_extra_cgb_pal ),
 	.spr_extra_index  ( spr_extra_index ),
+
+	.ra_oam_addr               (ra_oam_addr),
+	.ra_oam_req                (ra_oam_req),
+	.ra_oam_dout               (ra_oam_dout),
 
 	.Savestate_OAMRAMAddr      (Savestate_OAMRAMAddr),     
 	.Savestate_OAMRAMRWrEn     (Savestate_OAMRAMRWrEn),    

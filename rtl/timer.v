@@ -23,8 +23,18 @@ module timer (
 	input  [9:0]  SaveStateBus_Adr, 
 	input         SaveStateBus_wren,
 	input         SaveStateBus_rst, 
-	output [63:0] SaveStateBus_Dout
+	output [63:0] SaveStateBus_Dout,
+
+	// RetroAchievements read port ($FF04-$FF07)
+	input   [1:0] ra_addr,
+	output  [7:0] ra_do
 );
+	assign ra_do =
+		(ra_addr == 2'b00) ? div  :
+		(ra_addr == 2'b01) ? tima :
+		(ra_addr == 2'b10) ? tma  :
+					{5'b11111, tac};
+
 	assign cpu_do = 
 		(cpu_addr == 2'b00) ? div  : 
 		(cpu_addr == 2'b01) ? tima :

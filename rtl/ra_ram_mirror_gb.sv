@@ -5,6 +5,9 @@
 // Cart RAM in SDRAM, and writes them back to DDRAM for the ARM to read.
 //
 // Memory routing (rcheevos address → source):
+//   $8000-$9FFF   → VRAM             (BRAM port B, currently banked)
+//   $FE00-$FE9F   → OAM              (BRAM port B in sprites.v)
+//   $FF00-$FF7F   → I/O registers    (second read mux in gb.v)
 //   $A000-$BFFF   → Cart RAM bank 0  (SDRAM ch2)
 //   $C000-$CFFF   → WRAM bank 0      (BRAM port B)
 //   $D000-$DFFF   → WRAM bank 1      (BRAM port B)
@@ -18,7 +21,7 @@
 //   [0x00000] Header:   magic(32) + 0(8) + flags(8) + 0(16)
 //   [0x00008] Frame:    frame_counter(32) + 0(32)
 //   [0x00010] Debug:    {ver(8), 0(8), 0(16), timeout_cnt(16), ok_cnt(16)}
-//   [0x00018] Debug2:   {0(16), wram_cnt(16), cram_cnt(16), hram_cnt(16)}
+//   [0x00018] Debug2:   {vram_cnt(16), wram_cnt(16), cram_cnt(16), hram_cnt(16)}
 //
 //   [0x40000] AddrReq:  addr_count(32) + request_id(32)       (ARM → FPGA)
 //   [0x40008] Addrs:    addr[0](32) + addr[1](32), ...        (2 per 64-bit word)
@@ -42,6 +45,22 @@ module ra_ram_mirror_gb #(
 	output reg  [6:0] zpram_addr,
 	output reg        zpram_req,
 	input       [7:0] zpram_dout,
+
+	// VRAM BRAM read interface (currently banked; DMG is always bank 0)
+	output reg [12:0] vram_addr,
+	output reg        vram_req,
+	input       [7:0] vram_dout,
+
+	// OAM BRAM read interface
+	output reg  [7:0] oam_addr,
+	output reg        oam_req,
+	input       [7:0] oam_dout,
+
+	// I/O register read interface (combinational; io_ready low while the CPU
+	// is using the shared audio read port)
+	output reg  [7:0] io_addr,
+	input       [7:0] io_dout,
+	input             io_ready,
 
 	// Cart RAM via SDRAM ch2 (8-bit, directly connected)
 	output reg [24:0] sdram_addr,
@@ -81,14 +100,14 @@ localparam [12:0] MAX_ADDRS     = 13'd4096;
 // and "did the new core actually load?" is not a question a log should leave
 // open. Until now this header carried 0 and Main fell back to a hardcoded
 // "0.1", so the GB core was reporting a version it never wrote.
-localparam [15:0] CORE_VERSION  = 16'h0201;   // 2.1
+localparam [15:0] CORE_VERSION  = 16'h0203;   // 2.3 — VRAM + OAM + I/O mapped
 
 // Realtime query mailbox (Tier 1 smart cache) - [27:1] byte addressing
 localparam [27:1] QUERY_CTRL_ADDR = DDRAM_BASE + 27'h28000;  // byte offset 0x50000 / 2
 localparam [27:1] QUERY_REQ_BASE  = DDRAM_BASE + 27'h28004;  // byte offset 0x50008 / 2
 localparam [27:1] QUERY_RESP_BASE = DDRAM_BASE + 27'h28044;  // byte offset 0x50088 / 2
 localparam [27:1] ARM_CFG_ADDR    = DDRAM_BASE + 27'd32;        // byte offset 0x40 / 2: ARM-written config
-localparam [3:0]  MAX_RT_QUERIES  = 4'd16;
+localparam [7:0]  MAX_RT_QUERIES  = 8'd16;   // was [3:0]=4'd16 -> truncated to 0
 
 // Cart RAM SDRAM base address: {2'b01, 6'd0, offset[16:0]}
 localparam [24:0] CARTRAM_SDRAM_BASE = {2'b01, 6'd0, 17'd0};
@@ -160,6 +179,19 @@ localparam S_QRY_WR_CTRL  = 6'd34;
 localparam S_RD_ARMCFG    = 6'd35;  // initiate read of ARM config word
 localparam S_PARSE_ARMCFG = 6'd36;  // latch rtquery_armed from rd_data[0]
 localparam S_QRY_DISPATCH = 6'd37;  // route one query byte by qry_addr (multi-byte loop)
+localparam S_FETCH_VRAM   = 6'd38;  // Set VRAM BRAM address
+localparam S_VRAM_WAIT    = 6'd39;  // Wait for BRAM address register latch
+localparam S_VRAM_READ    = 6'd40;  // Capture VRAM data
+localparam S_QRY_VRAM_W   = 6'd41;  // VRAM wait (realtime query)
+localparam S_QRY_VRAM_R   = 6'd42;  // VRAM read (realtime query)
+localparam S_FETCH_OAM    = 6'd43;  // Set OAM BRAM address
+localparam S_OAM_WAIT     = 6'd44;  // Wait for BRAM address register latch
+localparam S_OAM_READ     = 6'd45;  // Capture OAM data
+localparam S_FETCH_IO     = 6'd46;  // Set I/O register address
+localparam S_IO_WAIT      = 6'd47;  // Sample once io_ready is asserted
+localparam S_QRY_OAM_W    = 6'd48;  // OAM wait (realtime query)
+localparam S_QRY_OAM_R    = 6'd49;  // OAM read (realtime query)
+localparam S_QRY_IO       = 6'd50;  // I/O sample (realtime query)
 
 reg [5:0] state;
 reg [5:0] return_state;
@@ -179,6 +211,7 @@ reg [12:0] val_word_idx;    // DDRAM word index for value writes
 reg  [7:0] fetch_byte;
 
 reg [15:0] sdram_timeout;
+reg [15:0] io_timeout;   // liveness guard only: see S_IO_WAIT
 
 // Debug counters (per frame)
 reg [15:0] dbg_ok_cnt;
@@ -186,12 +219,13 @@ reg [15:0] dbg_timeout_cnt;
 reg [15:0] dbg_wram_cnt;
 reg [15:0] dbg_cram_cnt;
 reg [15:0] dbg_hram_cnt;
+reg [15:0] dbg_vram_cnt;
 
 // Realtime query registers
 reg  [7:0] qry_request_seq;
 reg  [7:0] qry_last_seen_seq;
 reg  [7:0] qry_num;
-reg  [3:0] qry_idx;
+reg  [4:0] qry_idx;   // 0..16: needs 5 bits to reach the batch cap
 reg [31:0] qry_addr;
 reg  [7:0] qry_num_bytes;
 reg [31:0] qry_value;
@@ -258,6 +292,50 @@ always @(*) begin
 	end
 end
 
+// Translate rcheevos address to VRAM address [12:0]
+// $8000-$9FFF is a single 8K region; the bank mux lives in gb.v.
+reg [12:0] vram_translated;
+reg        vram_valid;
+
+always @(*) begin
+	vram_valid = 1'b0;
+	vram_translated = 13'd0;
+
+	if (cur_addr >= 32'h8000 && cur_addr <= 32'h9FFF) begin
+		vram_translated = cur_addr[12:0];
+		vram_valid = 1'b1;
+	end
+end
+
+// Translate rcheevos address to OAM address [7:0]
+// $FEA0-$FEFF is unusable memory and is not part of the rcheevos map.
+reg  [7:0] oam_translated;
+reg        oam_valid;
+
+always @(*) begin
+	oam_valid = 1'b0;
+	oam_translated = 8'd0;
+
+	if (cur_addr >= 32'hFE00 && cur_addr <= 32'hFE9F) begin
+		oam_translated = cur_addr[7:0];
+		oam_valid = 1'b1;
+	end
+end
+
+// Translate rcheevos address to I/O register address [7:0]
+reg  [7:0] io_translated;
+reg        io_valid;
+
+always @(*) begin
+	io_valid = 1'b0;
+	io_translated = 8'd0;
+
+	if (cur_addr >= 32'hFF00 && cur_addr <= 32'hFF7F) begin
+		io_translated = cur_addr[7:0];
+		io_valid = 1'b1;
+	end
+end
+
 // Translate rcheevos address to ZPRAM (HRAM) address [6:0]
 reg  [6:0] zpram_translated;
 reg        zpram_valid;
@@ -286,6 +364,8 @@ always @(posedge clk) begin
 		frame_counter <= 32'd0;
 		wram_req      <= 1'b0;
 		zpram_req     <= 1'b0;
+		vram_req      <= 1'b0;
+		oam_req       <= 1'b0;
 		qry_last_seen_seq <= 8'd0;
 		qry_poll_timer <= 11'd0;
 	end
@@ -299,6 +379,8 @@ always @(posedge clk) begin
 			active   <= 1'b0;
 			wram_req <= 1'b0;
 			zpram_req <= 1'b0;
+			vram_req <= 1'b0;
+			oam_req  <= 1'b0;
 			if (vblank_pending) begin
 				active <= 1'b1;
 				qry_poll_timer  <= 10'd0;
@@ -307,6 +389,7 @@ always @(posedge clk) begin
 				dbg_wram_cnt    <= 16'd0;
 				dbg_cram_cnt    <= 16'd0;
 				dbg_hram_cnt    <= 16'd0;
+				dbg_vram_cnt    <= 16'd0;
 				state           <= S_WR_BUSY_HDR;
 			end
 			else if (qry_poll_timer < 11'd2000) begin
@@ -430,6 +513,16 @@ always @(posedge clk) begin
 				dbg_hram_cnt <= dbg_hram_cnt + 16'd1;
 				state <= S_FETCH_ZPRAM;
 			end
+			else if (vram_valid) begin
+				dbg_vram_cnt <= dbg_vram_cnt + 16'd1;
+				state <= S_FETCH_VRAM;
+			end
+			else if (oam_valid) begin
+				state <= S_FETCH_OAM;
+			end
+			else if (io_valid) begin
+				state <= S_FETCH_IO;
+			end
 			else begin
 				// Unmapped address: return 0
 				fetch_byte <= 8'd0;
@@ -480,6 +573,75 @@ always @(posedge clk) begin
 			zpram_req  <= 1'b0;
 			dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
 			state      <= S_STORE_VAL;
+		end
+
+		// =============================================================
+		// VRAM: same 2-cycle latency as WRAM. Sampled at VBlank entry, so
+		// the CPU side of the dpram is idle for video and the tilemap holds
+		// the frame the player just saw.
+		// =============================================================
+		S_FETCH_VRAM: begin
+			vram_addr <= vram_translated;
+			vram_req  <= 1'b1;
+			state     <= S_VRAM_WAIT;
+		end
+
+		S_VRAM_WAIT: begin
+			state <= S_VRAM_READ;
+		end
+
+		S_VRAM_READ: begin
+			fetch_byte <= vram_dout;
+			vram_req   <= 1'b0;
+			dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
+			state      <= S_STORE_VAL;
+		end
+
+		// =============================================================
+		// OAM: same 2-cycle latency as WRAM
+		// =============================================================
+		S_FETCH_OAM: begin
+			oam_addr <= oam_translated;
+			oam_req  <= 1'b1;
+			state    <= S_OAM_WAIT;
+		end
+
+		S_OAM_WAIT: begin
+			state <= S_OAM_READ;
+		end
+
+		S_OAM_READ: begin
+			fetch_byte <= oam_dout;
+			oam_req    <= 1'b0;
+			dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
+			state      <= S_STORE_VAL;
+		end
+
+		// =============================================================
+		// I/O registers: combinational read. io_addr is registered, so it is
+		// already stable on the first S_IO_WAIT cycle; the only reason to
+		// spin is a CPU audio access holding the shared read port.
+		// =============================================================
+		S_FETCH_IO: begin
+			io_addr    <= io_translated;
+			io_timeout <= 16'd0;
+			state      <= S_IO_WAIT;
+		end
+
+		S_IO_WAIT: begin
+			io_timeout <= io_timeout + 16'd1;
+			if (io_ready) begin
+				fetch_byte <= io_dout;
+				dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
+				state      <= S_STORE_VAL;
+			end
+			// Only reachable if the CPU is frozen on an audio address (OSD
+			// pause), i.e. never during normal play.
+			else if (io_timeout >= 16'hFFFF) begin
+				fetch_byte      <= 8'hFF;   // open bus, same as an unmapped reg
+				dbg_timeout_cnt <= dbg_timeout_cnt + 16'd1;
+				state           <= S_STORE_VAL;
+			end
 		end
 
 		// =============================================================
@@ -624,7 +786,7 @@ always @(posedge clk) begin
 		// =============================================================
 		S_WR_DBG2: begin
 			ddram_addr   <= DDRAM_BASE + 27'd12;
-			ddram_din    <= {16'd0, dbg_wram_cnt, dbg_cram_cnt, dbg_hram_cnt};
+			ddram_din    <= {dbg_vram_cnt, dbg_wram_cnt, dbg_cram_cnt, dbg_hram_cnt};
 			ddram_be     <= 8'hFF;
 			ddram_rnw    <= 1'b0;
 			ddram_req    <= 1'b1;
@@ -655,9 +817,9 @@ always @(posedge clk) begin
 		S_QRY_PARSE: begin
 			if (rd_data[7:0] != qry_last_seen_seq && rd_data[15:8] != 8'd0) begin
 				qry_request_seq <= rd_data[7:0];
-				qry_num         <= (rd_data[15:8] > {4'd0, MAX_RT_QUERIES}) ?
-				                   {4'd0, MAX_RT_QUERIES} : rd_data[15:8];
-				qry_idx         <= 4'd0;
+				qry_num         <= (rd_data[15:8] > MAX_RT_QUERIES) ?
+				                   MAX_RT_QUERIES : rd_data[15:8];
+				qry_idx         <= 5'd0;
 				state           <= S_QRY_RD_REQ;
 			end else begin
 				state <= S_IDLE;
@@ -718,6 +880,24 @@ always @(posedge clk) begin
 				zpram_req  <= 1'b1;
 				state      <= S_QRY_ZPRAM_W;
 			end
+			else if (qry_addr >= 32'h8000 && qry_addr <= 32'h9FFF) begin
+				// VRAM
+				vram_addr <= qry_addr[12:0];
+				vram_req  <= 1'b1;
+				state     <= S_QRY_VRAM_W;
+			end
+			else if (qry_addr >= 32'hFE00 && qry_addr <= 32'hFE9F) begin
+				// OAM
+				oam_addr <= qry_addr[7:0];
+				oam_req  <= 1'b1;
+				state    <= S_QRY_OAM_W;
+			end
+			else if (qry_addr >= 32'hFF00 && qry_addr <= 32'hFF7F) begin
+				// I/O registers
+				io_addr    <= qry_addr[7:0];
+				io_timeout <= 16'd0;
+				state      <= S_QRY_IO;
+			end
 			else if ((qry_addr >= 32'hA000 && qry_addr <= 32'hBFFF) ||
 			         (qry_addr >= 32'h16000 && qry_addr <= 32'h33FFF)) begin
 				// Cart RAM (SDRAM)
@@ -767,6 +947,53 @@ always @(posedge clk) begin
 			end
 		end
 
+		S_QRY_VRAM_W: begin
+			state <= S_QRY_VRAM_R;
+		end
+
+		S_QRY_VRAM_R: begin
+			qry_value    <= qry_value | ({24'd0, vram_dout} << (qry_byte_idx * 8));
+			vram_req     <= 1'b0;
+			qry_byte_idx <= qry_byte_idx + 3'd1;
+			if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
+				state <= S_QRY_WR_RESP;
+			end else begin
+				qry_addr <= qry_addr + 32'd1;
+				state    <= S_QRY_DISPATCH;
+			end
+		end
+
+		S_QRY_OAM_W: begin
+			state <= S_QRY_OAM_R;
+		end
+
+		S_QRY_OAM_R: begin
+			qry_value    <= qry_value | ({24'd0, oam_dout} << (qry_byte_idx * 8));
+			oam_req      <= 1'b0;
+			qry_byte_idx <= qry_byte_idx + 3'd1;
+			if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
+				state <= S_QRY_WR_RESP;
+			end else begin
+				qry_addr <= qry_addr + 32'd1;
+				state    <= S_QRY_DISPATCH;
+			end
+		end
+
+		S_QRY_IO: begin
+			io_timeout <= io_timeout + 16'd1;
+			if (io_ready || io_timeout >= 16'hFFFF) begin
+				qry_value    <= qry_value | ({24'd0, io_ready ? io_dout : 8'hFF}
+				                             << (qry_byte_idx * 8));
+				qry_byte_idx <= qry_byte_idx + 3'd1;
+				if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
+					state <= S_QRY_WR_RESP;
+				end else begin
+					qry_addr <= qry_addr + 32'd1;
+					state    <= S_QRY_DISPATCH;
+				end
+			end
+		end
+
 		S_QRY_CRAM: begin
 			// Translate address to SDRAM offset
 			if (qry_addr >= 32'hA000 && qry_addr <= 32'hBFFF)
@@ -802,8 +1029,8 @@ always @(posedge clk) begin
 			ddram_be     <= 8'hFF;
 			ddram_rnw    <= 1'b0;
 			ddram_req    <= 1'b1;
-			qry_idx      <= qry_idx + 4'd1;
-			if (qry_idx + 4'd1 >= qry_num[3:0])
+			qry_idx      <= qry_idx + 5'd1;
+			if (qry_idx + 5'd1 >= {1'b0, qry_num[7:0]})
 				return_state <= S_QRY_WR_CTRL;
 			else
 				return_state <= S_QRY_RD_REQ;
