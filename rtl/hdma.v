@@ -9,6 +9,7 @@ module hdma(
 	input  [3:0] addr,
 	input        wr,
 	output [7:0] dout,
+	output [7:0] ra_hdma5_do,   // RetroAchievements: $FF55 value without the addr decode
 	input  [7:0] din,
 	
 	input [1:0] lcd_mode, 
@@ -190,6 +191,7 @@ always @(posedge clk) begin
 end
 
 assign dout = (sel_reg && addr==4'd5) ? {~hdma_enabled, hdma_length[6:0]} : 8'hFF;
+assign ra_hdma5_do = {~hdma_enabled, hdma_length[6:0]};
 
 endmodule
 

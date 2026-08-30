@@ -54,6 +54,11 @@ module sprites (
 	input [7:0] oam_di,
 	output [7:0] oam_do,
 
+	// RetroAchievements OAM read port (port B, shared with savestate)
+	input  [7:0] ra_oam_addr,
+	input        ra_oam_req,
+	output [7:0] ra_oam_dout,
+
 	input extra_spr_en,
 	input extra_wait,
 
@@ -109,8 +114,8 @@ dpram #(7,8) oam_data_l (
 	.q_a       (oam_l_q  ),
 	
 	.clock_b   (clk),
-	.address_b (Savestate_OAMRAMAddr[7:1]),
-	.wren_b    (Savestate_OAMRAMRWrEn & ~Savestate_OAMRAMAddr[0]),
+	.address_b (ra_oam_req ? ra_oam_addr[7:1] : Savestate_OAMRAMAddr[7:1]),
+	.wren_b    (ra_oam_req ? 1'b0 : (Savestate_OAMRAMRWrEn & ~Savestate_OAMRAMAddr[0])),
 	.data_b    (Savestate_OAMRAMWriteData),
 	.q_b       (Savestate_OAMRAMReadDataL)
 );
@@ -123,8 +128,8 @@ dpram #(7,8) oam_data_h (
 	.q_a       (oam_h_q  ),
 
 	.clock_b   (clk),
-	.address_b (Savestate_OAMRAMAddr[7:1]),
-	.wren_b    (Savestate_OAMRAMRWrEn & Savestate_OAMRAMAddr[0]),
+	.address_b (ra_oam_req ? ra_oam_addr[7:1] : Savestate_OAMRAMAddr[7:1]),
+	.wren_b    (ra_oam_req ? 1'b0 : (Savestate_OAMRAMRWrEn & Savestate_OAMRAMAddr[0])),
 	.data_b    (Savestate_OAMRAMWriteData),
 	.q_b       (Savestate_OAMRAMReadDataH)
 );
@@ -135,6 +140,14 @@ always @(posedge clk) begin
 end
 
 assign Savestate_OAMRAMReadData = Savestate_OAMRAMAddr0_d ? Savestate_OAMRAMReadDataH : Savestate_OAMRAMReadDataL;
+
+// RA byte select needs the same one-cycle delay as the BRAM output.
+reg ra_oam_addr0_d;
+always @(posedge clk) begin
+	ra_oam_addr0_d <= ra_oam_addr[0];
+end
+
+assign ra_oam_dout = ra_oam_addr0_d ? Savestate_OAMRAMReadDataH : Savestate_OAMRAMReadDataL;
 
 reg [7:0] sprite_x[0:SPRITES_PER_LINE-1];
 reg [3:0] sprite_y[0:SPRITES_PER_LINE-1];

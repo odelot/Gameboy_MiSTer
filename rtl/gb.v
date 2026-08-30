@@ -144,7 +144,16 @@ module gb (
 	output  [7:0] ra_wram_dout,
 	input   [6:0] ra_zpram_addr,
 	input         ra_zpram_req,
-	output  [7:0] ra_zpram_dout
+	output  [7:0] ra_zpram_dout,
+	input  [12:0] ra_vram_addr,
+	input         ra_vram_req,
+	output  [7:0] ra_vram_dout,
+	input   [7:0] ra_oam_addr,
+	input         ra_oam_req,
+	output  [7:0] ra_oam_dout,
+	input   [7:0] ra_io_addr,
+	output  [7:0] ra_io_dout,
+	output        ra_io_ready
 );
 
 // savestates
@@ -316,6 +325,46 @@ wire [7:0] cpu_di =
 		sel_FF74?FF74: // unused register, all bits read/write, only in CGB mode
 		sel_FF75?{1'b1,FF75, 4'b1111}: // unused register, bits 4-6 read/write
         sel_FF50?{6'b0, fast_boot_en, boot_gba_en}: // MiSTer special instruction register 
+		8'hff;
+
+// --------------------------------------------------------------------
+// RetroAchievements I/O register read ($FF00-$FF7F)
+// --------------------------------------------------------------------
+// Mirrors the cpu_di mux above with ra_io_addr in place of cpu_addr, so RA
+// reads return exactly what a CPU read would. Address-muxed sources (video,
+// timer, hdma) grew a dedicated second read port in their own module.
+//
+// Audio is the one source whose read port cannot be duplicated for free: it
+// lives in gbc_snd.vhd and is shared. s1_addr is handed to RA only while the
+// CPU is not accessing audio, so ra_io_ready goes low for audio addresses
+// during a CPU audio cycle and the mirror waits for a clean sample.
+wire [7:0] ra_video_do;
+wire [7:0] ra_timer_do;
+wire [7:0] ra_hdma5_do;
+
+wire ra_io_is_audio = (ra_io_addr >= 8'h10 && ra_io_addr <= 8'h3f);
+assign ra_io_ready = ~(ra_io_is_audio & sel_audio);
+
+assign ra_io_dout =
+		(ra_io_addr == 8'h00) ? joy_do :                                       // joystick
+		(ra_io_addr == 8'h01) ? sb_o :                                         // serial data
+		(ra_io_addr == 8'h02) ? sc_r :                                         // serial control
+		(ra_io_addr[7:4] == 4'h0 && ra_io_addr[3:2] == 2'b01) ? ra_timer_do :  // FF04-FF07
+		(ra_io_addr == 8'h0f) ? {3'b111, if_r} :                               // interrupt flag
+		ra_io_is_audio ? audio_do :                                            // FF10-FF3F
+		(ra_io_addr[7:4] == 4'h4 && ra_io_addr[3:0] <= 4'hb) ? ra_video_do :   // FF40-FF4B
+		(isGBC && boot_rom_enabled && ra_io_addr == 8'h4c) ? { 4'hF, ff4c_key0, 2'b10 } :
+		(isGBC && isGBC_mode && ra_io_addr == 8'h4d) ? {cpu_speed,6'h3f,prepare_switch} :
+		(isGBC && ra_io_addr == 8'h4f) ? {7'h7f,vram_bank} :
+		(boot_rom_enabled && ra_io_addr == 8'h50) ? {6'b0, fast_boot_en, boot_gba_en} :
+		(isGBC && isGBC_mode && ra_io_addr == 8'h55) ? ra_hdma5_do :           // FF51-54 read FF
+		(isGBC && isGBC_mode && ra_io_addr == 8'h56) ? 8'h02 :                 // RP
+		(isGBC && ra_io_addr >= 8'h68 && ra_io_addr <= 8'h6c) ? ra_video_do :  // GBC palettes
+		(isGBC && isGBC_mode && ra_io_addr == 8'h70) ? {5'h1f,wram_bank} :
+		(isGBC && ra_io_addr == 8'h72) ? FF72 :
+		(isGBC && ra_io_addr == 8'h73) ? FF73 :
+		(isGBC && isGBC_mode && ra_io_addr == 8'h74) ? FF74 :
+		(isGBC && ra_io_addr == 8'h75) ? {1'b1,FF75, 4'b1111} :
 		8'hff;
 
 wire cpu_wr_n;
@@ -545,7 +594,7 @@ gbc_snd audio (
 
 	.s1_read  		( audio_rd  		),
 	.s1_write 		( audio_wr  		),
-	.s1_addr    	( cpu_addr[6:0]	),
+	.s1_addr    	( sel_audio ? cpu_addr[6:0] : ra_io_addr[6:0] ),
    .s1_readdata 	( snd_d_out       ),
 	.s1_writedata  ( snd_d_in       	),
 
@@ -757,6 +806,8 @@ timer timer (
 				 
 	.cpu_sel     		 ( sel_timer     ),
 	.cpu_addr    		 ( cpu_addr[1:0] ),
+	.ra_addr             ( ra_io_addr[1:0] ),
+	.ra_do               ( ra_timer_do   ),
 	.cpu_wr      		 ( !cpu_wr_n_edge ),
 	.cpu_di      		 ( cpu_do        ),
 	.cpu_do      		 ( timer_do      ),
@@ -804,6 +855,12 @@ video video (
 	.cpu_wr      ( !cpu_wr_n_edge ),
 	.cpu_di      ( cpu_do        ),
 	.cpu_do      ( video_do      ),
+
+	.ra_reg_addr ( ra_io_addr    ),
+	.ra_reg_do   ( ra_video_do   ),
+	.ra_oam_addr ( ra_oam_addr   ),
+	.ra_oam_req  ( ra_oam_req    ),
+	.ra_oam_dout ( ra_oam_dout   ),
 	
 	.lcd_on      ( lcd_on        ),
 	.lcd_clkena  ( lcd_clkena    ),
@@ -865,8 +922,8 @@ dpram #(13) vram0 (
 	.q_a       (vram_do  ),
 	
 	.clock_b   (clk_sys),
-	.address_b (Savestate_RAMAddr[12:0]),
-	.wren_b    (Savestate_RAMRWrEn[1] & !Savestate_RAMAddr[13]),
+	.address_b (ra_vram_req ? ra_vram_addr : Savestate_RAMAddr[12:0]),
+	.wren_b    (ra_vram_req ? 1'b0 : (Savestate_RAMRWrEn[1] & !Savestate_RAMAddr[13])),
 	.data_b    (Savestate_RAMWriteData[7:0]),
 	.q_b       (Savestate_RAMReadData_VRAM0)
 );
@@ -880,13 +937,19 @@ dpram #(13) vram1 (
 	.q_a       (vram1_do  ),
 	
 	.clock_b   (clk_sys),
-	.address_b (Savestate_RAMAddr[12:0]),
-	.wren_b    (Savestate_RAMRWrEn[1] & Savestate_RAMAddr[13]),
+	.address_b (ra_vram_req ? ra_vram_addr : Savestate_RAMAddr[12:0]),
+	.wren_b    (ra_vram_req ? 1'b0 : (Savestate_RAMRWrEn[1] & Savestate_RAMAddr[13])),
 	.data_b    (Savestate_RAMWriteData[7:0]),
 	.q_b       (Savestate_RAMReadData_VRAM1)
 );
 
 assign Savestate_RAMReadData_VRAM = Savestate_RAMAddr[13] ? Savestate_RAMReadData_VRAM1 : Savestate_RAMReadData_VRAM0;
+
+// RetroAchievements sees $8000-$9FFF the way a CPU read would: the currently
+// banked VRAM. rcheevos' GameBoy/GBC map has no region for VRAM bank 1, so
+// there is no second address range to expose it at. On DMG this is always
+// bank 0 -- vram_bank is only writable when isGBC.
+assign ra_vram_dout = vram_bank ? Savestate_RAMReadData_VRAM1 : Savestate_RAMReadData_VRAM0;
 
 //GBC VRAM banking
 
@@ -916,6 +979,7 @@ hdma hdma(
 	.addr			       ( cpu_addr[3:0] ),
 	.wr			       ( !cpu_wr_n_edge   ),
 	.dout			       ( hdma_do       ),
+	.ra_hdma5_do       ( ra_hdma5_do   ),
 	.din               ( cpu_do        ),
 	
 	.lcd_mode          ( lcd_mode      ),

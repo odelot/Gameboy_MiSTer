@@ -496,6 +496,35 @@ wire [15:0] save_dout;
 
 assign Savestate_CRAMReadData = bram_save ? Savestate_CRAM_Q : sdram_do;
 
+// ==================== RetroAchievements ====================
+wire        ra_active;
+wire [14:0] ra_wram_addr;
+wire        ra_wram_req;
+wire  [7:0] ra_wram_dout;
+wire  [6:0] ra_zpram_addr;
+wire        ra_zpram_req;
+wire  [7:0] ra_zpram_dout;
+wire [12:0] ra_vram_addr;
+wire        ra_vram_req;
+wire  [7:0] ra_vram_dout;
+wire  [7:0] ra_oam_addr;
+wire        ra_oam_req;
+wire  [7:0] ra_oam_dout;
+wire  [7:0] ra_io_addr;
+wire  [7:0] ra_io_dout;
+wire        ra_io_ready;
+wire [24:0] ra_sdram_addr;
+wire        ra_sdram_rd;
+wire  [7:0] ra_sdram_dout;
+wire        ra_sdram_busy;
+wire [27:1] ra_ddram_addr;
+wire [63:0] ra_ddram_din;
+wire        ra_ddram_req;
+wire        ra_ddram_rnw;
+wire  [7:0] ra_ddram_be;
+wire [63:0] ra_ddram_dout;
+wire        ra_ddram_ready;
+
 sdram sdram
 (
 	.SDRAM_DQ(SDRAM_DQ),
@@ -693,6 +722,7 @@ wire [15:0] GB_AUDIO_L;
 wire [15:0] GB_AUDIO_R;
 
 // the gameboy itself
+
 gb gb (
 	.reset	    ( reset      ),
 	
@@ -805,7 +835,16 @@ gb gb (
 	.ra_wram_dout  (ra_wram_dout ),
 	.ra_zpram_addr (ra_zpram_addr),
 	.ra_zpram_req  (ra_zpram_req ),
-	.ra_zpram_dout (ra_zpram_dout)
+	.ra_zpram_dout (ra_zpram_dout),
+	.ra_vram_addr  (ra_vram_addr ),
+	.ra_vram_req   (ra_vram_req  ),
+	.ra_vram_dout  (ra_vram_dout ),
+	.ra_oam_addr   (ra_oam_addr  ),
+	.ra_oam_req    (ra_oam_req   ),
+	.ra_oam_dout   (ra_oam_dout  ),
+	.ra_io_addr    (ra_io_addr   ),
+	.ra_io_dout    (ra_io_dout   ),
+	.ra_io_ready   (ra_io_ready  )
 );
 
 assign AUDIO_L = (fast_forward && status[25]) ? 16'd0 : GB_AUDIO_L;
@@ -973,25 +1012,6 @@ wire fastforward = joystick_0[8] && !ioctl_download && !OSD_STATUS;
 
 wire sleep_savestate, savestate_ovr;
 
-// ==================== RetroAchievements ====================
-wire        ra_active;
-wire [14:0] ra_wram_addr;
-wire        ra_wram_req;
-wire  [7:0] ra_wram_dout;
-wire  [6:0] ra_zpram_addr;
-wire        ra_zpram_req;
-wire  [7:0] ra_zpram_dout;
-wire [24:0] ra_sdram_addr;
-wire        ra_sdram_rd;
-wire  [7:0] ra_sdram_dout;
-wire        ra_sdram_busy;
-wire [27:1] ra_ddram_addr;
-wire [63:0] ra_ddram_din;
-wire        ra_ddram_req;
-wire        ra_ddram_rnw;
-wire  [7:0] ra_ddram_be;
-wire [63:0] ra_ddram_dout;
-wire        ra_ddram_ready;
 
 ra_ram_mirror_gb ra_ram_mirror_gb (
 	.clk          (clk_sys),
@@ -1010,6 +1030,18 @@ ra_ram_mirror_gb ra_ram_mirror_gb (
 	.zpram_addr   (ra_zpram_addr),
 	.zpram_req    (ra_zpram_req ),
 	.zpram_dout   (ra_zpram_dout),
+
+	.vram_addr    (ra_vram_addr ),
+	.vram_req     (ra_vram_req  ),
+	.vram_dout    (ra_vram_dout ),
+
+	.oam_addr     (ra_oam_addr  ),
+	.oam_req      (ra_oam_req   ),
+	.oam_dout     (ra_oam_dout  ),
+
+	.io_addr      (ra_io_addr   ),
+	.io_dout      (ra_io_dout   ),
+	.io_ready     (ra_io_ready  ),
 
 	.sdram_addr   (ra_sdram_addr),
 	.sdram_rd     (ra_sdram_rd  ),
