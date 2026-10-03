@@ -144,8 +144,15 @@ always @(posedge clk) begin
 			ds <= 0;
 			{bank,a} <= ch2_addr;
 			data <= {ch2_din,ch2_din};
-			ram_req <= wr[2] || (last_a[2] != ch2_addr[24:1]);
-			last_a[2] <= wr[2] ? '1 : ch2_addr[24:1];
+			// ch2 = RetroAchievements cart RAM reader: always go to the chip.
+			// The per-channel "same word as last time" cache is only
+			// invalidated by that channel's own writes, but cart RAM is
+			// written by the CPU through ch0, so a cached ch2 read returned
+			// the value from the first read forever (e.g. Mega Man Xtreme 2's
+			// boss flag at $B821 never left 0x00). ch2 traffic is a handful of
+			// reads per frame, so skipping the cache costs nothing.
+			ram_req <= 1'b1;
+			last_a[2] <= '1;
 			ch2_busy <= 1;
 			state <= STATE_START;
 		end

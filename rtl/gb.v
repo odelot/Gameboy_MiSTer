@@ -448,8 +448,24 @@ end
 // WRAM power-on byte: RAVBA's `(temp & 0x8) ^ ((temp & 0x800) >> 8)` — bit 3
 // XOR bit 11 of the CPU address. The BRAM index is {bank[2:0], offset[11:0]},
 // so bits 3 and 11 are the same bits for banks 0/1 ($C000/$D000 contribute
-// nothing at those positions); GBC banks 2-7 inherit the same pattern.
-wire [7:0] ram_clr_wram_data = (ram_clr_addr[3] ^ ram_clr_addr[11]) ? 8'h0F : 8'hFF;
+// nothing at those positions).
+//
+// GBC differs, and the DMG pattern must NOT be applied there. RAVBA's real
+// gbReset() writes 0x00 instead of 0x0F when `(gbHardware & 0x02) &&
+// gbGBCColorType == 0` (GBC hardware), then copies $C000-$CFFF into every
+// gbWram bank *except bank 2* ("most of the 2nd bank is filled with 00s").
+// gbWram uses the same {bank, offset} layout as this BRAM, so bank 2 is
+// ram_clr_addr[14:12] == 2.
+//
+// Getting this wrong is visible: Toki Tori (GBC) renders its variable-width
+// text and HUD icons into a WRAM buffer it never fully clears, and the 0x0F
+// bytes showed up as static vertical bars (half-tile / full-tile black).
+wire ram_clr_wram_alt  = ram_clr_addr[3] ^ ram_clr_addr[11];
+wire ram_clr_gbc_bank2 = (ram_clr_addr[14:12] == 3'd2);
+wire [7:0] ram_clr_wram_data =
+		~isGBC            ? (ram_clr_wram_alt ? 8'h0F : 8'hFF) :   // DMG / SGB
+		ram_clr_gbc_bank2 ? 8'h00 :                                // GBC bank 2
+		                    (ram_clr_wram_alt ? 8'h00 : 8'hFF);    // GBC other banks
 
 wire reset_ss_raw;
 wire reset_ss = reset_ss_raw | ram_clr;

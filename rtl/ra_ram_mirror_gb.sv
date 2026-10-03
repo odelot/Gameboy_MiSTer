@@ -100,7 +100,7 @@ localparam [12:0] MAX_ADDRS     = 13'd4096;
 // and "did the new core actually load?" is not a question a log should leave
 // open. Until now this header carried 0 and Main fell back to a hardcoded
 // "0.1", so the GB core was reporting a version it never wrote.
-localparam [15:0] CORE_VERSION  = 16'h0203;   // 2.3 — VRAM + OAM + I/O mapped
+localparam [15:0] CORE_VERSION  = 16'h0206;   // 2.6 — SDRAM ch2 (cart RAM) bypasses stale word cache
 
 // Realtime query mailbox (Tier 1 smart cache) - [27:1] byte addressing
 localparam [27:1] QUERY_CTRL_ADDR = DDRAM_BASE + 27'h28000;  // byte offset 0x50000 / 2
